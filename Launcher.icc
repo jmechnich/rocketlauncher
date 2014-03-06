@@ -1,0 +1,328 @@
+template<class MsgIface, class UserIface>
+int Launcher<MsgIface,UserIface>::update_status()
+{
+  // read status
+  char status=0;
+  int ret = _mi.read(&status);
+  if(ret<0) {
+    std::ostringstream oss;
+    oss << "Read failed: " << ret << " (" << strerror(-ret) << ")";
+    _ui.print_status( oss.str());
+    return ret;
+  }
+  // set phi and eta to min/max if at endpoint
+  if     ( status & MSG_RIGHT) _phi   = _phiMin;
+  else if( status & MSG_LEFT)  _phi   = _phiMax;
+  if     ( status & MSG_UP)    _theta = _thetaMin;
+  else if( status & MSG_DOWN)  _theta = _thetaMax;
+  // stop firing if status bit set
+  if( status & MSG_FIRE) move(MSG_STOP);
+  // publish status
+  _ui.setStatus(status);
+  if(status != _statusOld) {
+    _statusOld = status;
+    _ui.resetControls(_current);
+  }
+  else if(status & _current) _ui.resetControls(_current);
+  return status;
+}
+
+template<class MsgIface, class UserIface>
+void Launcher<MsgIface,UserIface>::moveTimed( char cmd, double dt)
+{
+  // do nothing if already at endpoint
+  if(update_status() & cmd) return;
+  // move command updates _start
+  move(cmd);
+  dt += _start;
+  while( true) {
+    usleep(50000);
+    _timer.update();
+    if( _timer.toDouble() > dt) {
+      move(MSG_STOP);
+      update_status();
+      break;
+    }
+  }
+}
+
+template<class MsgIface, class UserIface>
+int Launcher<MsgIface,UserIface>::wait( char cmd)
+{
+  char status=0;
+  int ret=0;
+  while( !(((ret=_mi.read(&status))<0) || (status & cmd))) usleep(50000);
+  return ret;
+}
+
+template<class MsgIface, class UserIface>
+int Launcher<MsgIface,UserIface>::moveHome( char cmd)
+{
+  int ret;
+  if(_debug) std::cerr << std::showbase << std::internal <<std::hex
+                       << std::setfill('0');
+  if(_debug) std::cerr << "moveHome: " << std::setw(4) << int(cmd)
+                       << " started" << std::endl;
+  ret=move(cmd);
+  if(_debug) std::cerr << "moveHome: " << std::setw(4) << int(cmd)
+                       << " waiting" << std::endl;
+  ret=wait(cmd);
+  if(_debug) std::cerr << "moveHome: " << std::setw(4) << int(cmd)
+                       << " finished" << std::endl;
+  if(_debug) std::cerr << std::dec;
+  return ret;
+}
+  
+template<class MsgIface, class UserIface>
+int Launcher<MsgIface,UserIface>::moveRel( double theta, double phi)
+{
+  if( !calibrated()) return -1;
+  double dTheta = fabs(theta)/thetaRange();
+  if( theta > 0)      moveTimed( MSG_DOWN, _thetaPos*dTheta);
+  else if( theta < 0) moveTimed( MSG_UP,   _thetaNeg*dTheta);
+  double dPhi   = fabs(phi)/phiRange();
+  if( phi > 0)      moveTimed( MSG_LEFT,  _phiPos*dPhi);
+  else if( phi < 0) moveTimed( MSG_RIGHT, _phiNeg*dPhi);
+  return 0;
+}
+
+template<class MsgIface, class UserIface>
+int Launcher<MsgIface,UserIface>::moveAbs( double theta, double phi)
+{
+  if( !calibrated()) return -1;
+  moveRel( theta-_theta, phi-_phi);
+  return 0;
+}
+  
+template<class MsgIface, class UserIface>
+int Launcher<MsgIface,UserIface>::move(char cmd)
+{
+  if(cmd & (MSG_STATUS|MSG_NONE)) return 0;
+  // send command
+  int ret = _mi.send(cmd);
+  if(ret<0) {
+    std::ostringstream oss;
+    oss << "Cmd: " << cmd << ", RV: " << ret;
+    oss << " (" << strerror(-ret) << ")";
+    _ui.print_status( oss.str());
+    return ret;
+  }
+  // read status
+  char status=0;
+  ret = _mi.read(&status);
+  if(ret<0) {
+    std::ostringstream oss;
+    oss << "Cmd: " << cmd << ", read status RV: " << ret;
+    oss << " (" << strerror(-ret) << ")";
+    _ui.print_status( oss.str());
+    return ret;
+  }
+  // update launcher position, handle timer
+  _timer.update();
+  if( _current != cmd && _start > 0) {
+    if(!(status & _current))
+        adjust( _current, _timer.toDouble()-_start);
+    _start=0;
+  }
+  if( !(cmd & (MSG_STOP|MSG_FIRE))) _start = _timer.toDouble();
+  // store command
+  _current = cmd;
+  return ret;
+}
+  
+template<class MsgIface, class UserIface>
+int Launcher<MsgIface,UserIface>::fire()
+{
+  _ui.announce("LAUNCH SEQUENCE INITIATED");
+  _timer.update();
+  double start=_timer.toDouble();
+  move(MSG_FIRE);
+  wait(MSG_FIRE);
+  move(MSG_STOP);
+  _timer.update();
+  double stop=_timer.toDouble();
+  _ui.announce();
+  std::ostringstream oss;
+  oss << "Stopped firing after " << stop-start << " seconds";
+  _ui.print_status( oss.str());
+  return 0;
+}
+
+template<class MsgIface, class UserIface>
+int Launcher<MsgIface,UserIface>::fireTimeout(double timeout)
+{
+  if(timeout<0||timeout>20) return -1;
+  _ui.announce("LAUNCH SEQUENCE INITIATED");
+  _timer.update();
+  double start=_timer.toDouble();
+  move(MSG_FIRE);
+  usleep(timeout*1e6);
+  move(MSG_STOP);
+  _timer.update();
+  double stop=_timer.toDouble();
+  _ui.announce();
+  std::ostringstream oss;
+  oss << "Stopped firing after " << timeout << " seconds (" << stop-start
+      << " realtime)";
+  _ui.print_status( oss.str());
+  return 0;
+}
+  
+template<class MsgIface, class UserIface>
+int Launcher<MsgIface,UserIface>::connect()
+{
+  int ret=0;
+  ret=_mi.open();
+  if(ret) return ret;
+  ret=_ui.open();
+  return ret;
+}
+
+template<class MsgIface, class UserIface>
+int Launcher<MsgIface,UserIface>::disconnect()
+{
+  int ret=0;
+  ret=_ui.close();
+  if(ret) return ret;
+  ret=_mi.close();
+  return ret;
+}
+
+template<class MsgIface, class UserIface>
+void Launcher<MsgIface,UserIface>::printStatusPV()
+{
+  std::ostringstream oss;
+  oss << "(" << _thetaMin << "/" << _theta << "/" << _thetaMax << ","
+      << _phiMin << "/" << _phi << "/" << _phiMax << ")";
+  _ui.print_status(oss.str());
+}
+  
+template<class MsgIface, class UserIface>
+void Launcher<MsgIface,UserIface>::printStatusMV()
+{
+  std::ostringstream oss;
+  oss << "thetaPos=" << _thetaPos << " thetaNeg=" << _thetaNeg;
+  oss << " phiPos=" << _phiPos << " phiNeg=" << _phiNeg;
+  _ui.print_status(oss.str());
+}
+
+template<class MsgIface, class UserIface>
+void Launcher<MsgIface,UserIface>::printHelp()
+{
+  _ui.showHelp();
+}
+  
+template<class MsgIface, class UserIface>
+void Launcher<MsgIface,UserIface>::adjust(char cmd, double dt)
+{
+  if(dt<0) return;
+  if     (cmd & MSG_DOWN) _theta += dt/_thetaPos*thetaRange();
+  else if(cmd & MSG_UP)   _theta -= dt/_thetaNeg*thetaRange();
+  else if(cmd & MSG_LEFT)   _phi += dt/_phiPos*phiRange();
+  else if(cmd & MSG_RIGHT)  _phi -= dt/_phiNeg*phiRange();
+}
+  
+template<class MsgIface, class UserIface>
+bool Launcher<MsgIface,UserIface>::process()
+{
+  int status = update_status();
+  if(!status)
+  {
+    _mi.send(MSG_STOP);
+    //return false;
+  }
+  _ui.setStatus(status);
+  _ui.process();
+  _ui.resetControls(_current);
+  return !(_start < 0);
+}
+
+template<class MsgIface, class UserIface>
+void Launcher<MsgIface,UserIface>::goRel()
+{
+  double theta, phi;
+  std::istringstream iss;
+  do {
+    iss.clear();
+    iss.str(_ui.getString("Enter theta:"));
+    iss >> theta;
+  } while( iss.fail());
+  do {
+    iss.clear();
+    iss.str(_ui.getString("Enter phi:"));
+    iss >> phi;
+  } while( iss.fail());
+  std::ostringstream oss;
+  oss << "Go relative (" << theta << "," << phi << ")";
+  _ui.print_status(oss.str());
+}
+
+template<class MsgIface, class UserIface>
+void Launcher<MsgIface,UserIface>::goAbs()
+{
+  if(!calibrated()) return;
+          
+  double theta, phi;
+  std::istringstream iss;
+  do {
+    iss.clear();
+    iss.str(_ui.getString("Enter theta:"));
+    if(!iss.str().size()) return;
+    iss >> theta;
+  } while( iss.fail());
+  do {
+    iss.clear();
+    iss.str(_ui.getString("Enter phi:"));
+    if(!iss.str().size()) return;
+    iss >> phi;
+  } while( iss.fail());
+  std::ostringstream oss;
+  oss << "Go absolute (" << theta << "," << phi << ")";
+  _ui.print_status(oss.str());
+}
+
+template<class MsgIface, class UserIface>
+void Launcher<MsgIface,UserIface>::goHome()
+{
+  std::string s = "Going to home position";
+  _ui.print_status(s);
+  moveHome(MSG_RIGHT);
+  moveHome(MSG_UP);
+}
+
+template<class MsgIface, class UserIface>
+void Launcher<MsgIface,UserIface>::calibrate()
+{
+  std::string s;
+  goHome();
+  _ui.print_status( s="Calibrating phi");
+  moveHome(MSG_LEFT);
+  _timer.update();
+  _phiPos = _timer.toDouble()-_start;
+  _ui.print_status( s="Calibrating theta");
+  moveHome(MSG_DOWN);
+  _timer.update();
+  _thetaPos = _timer.toDouble()-_start;
+  _ui.print_status( s="Validating phi");
+  moveHome(MSG_RIGHT);
+  _timer.update();
+  _phiNeg = _timer.toDouble()-_start;
+  _ui.print_status( s="Validating theta");
+  moveHome(MSG_UP);
+  _timer.update();
+  _thetaNeg = _timer.toDouble()-_start;
+  printStatusMV();
+}
+
+template<class MsgIface, class UserIface>
+void Launcher<MsgIface,UserIface>::init()
+{
+  _current = MSG_NONE; _statusOld = MSG_NONE;
+  _start = 0;
+  _debug=false;
+  _theta=-1;    _phi=-1;
+  _thetaMin=45; _phiMin=0;
+  _thetaMax=90; _phiMax=360;
+  _thetaPos=0;  _phiPos=0;
+  _thetaNeg=0;  _phiNeg=0;
+}
